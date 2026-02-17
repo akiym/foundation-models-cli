@@ -18,6 +18,7 @@ swift build -c release
 
 ```
 foundation-models-cli <prompt> [options]
+foundation-models-cli --listen <host:port>
 ```
 
 ### Options
@@ -30,6 +31,7 @@ foundation-models-cli <prompt> [options]
 | `--greedy` | | Use greedy sampling (deterministic output) |
 | `--stream` | `-s` | Enable streaming output |
 | `--field` | `-f` | Structured output field (`name:Type:description`) |
+| `--listen` | | Start Ollama-compatible API server (`host:port`) |
 
 Supported types for `--field`: `String`, `Int`, `Double`, `Bool`, `[String]`, `[Int]`, `[Double]`, `[Bool]`
 
@@ -56,3 +58,21 @@ foundation-models-cli "List 3 Japanese dishes" \
   -f "dishes:[String]:List of dish names" \
   -f "count:Int:Number of dishes"
 ```
+
+### Ollama-compatible API server
+
+Use `--listen` to start an Ollama-compatible HTTP API server. This allows any Ollama client to use Apple's on-device model.
+
+```
+foundation-models-cli --listen 127.0.0.1:11434
+```
+
+Supported endpoints:
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Health check |
+| GET | `/api/version` | Version information |
+| GET | `/api/tags` | List models |
+| POST | `/api/generate` | Text generation (streaming/non-streaming) |
+| POST | `/api/chat` | Chat completion (streaming/non-streaming) |

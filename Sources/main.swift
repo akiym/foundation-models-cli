@@ -2,6 +2,8 @@ import ArgumentParser
 import Darwin
 import Foundation
 import FoundationModels
+import HTTPTypes
+import Hummingbird
 
 enum FieldType: String, CaseIterable {
     case string = "String"
@@ -64,6 +66,153 @@ struct FieldSpec {
     }
 }
 
+// MARK: - Ollama API Types
+
+private let ollamaModelDisplayName = "Apple Foundation Model"
+private let ollamaModelID = "apple-foundation-model"
+private let maxRequestBodySize = 1_048_576
+
+struct OllamaGenerateRequest: Decodable, Sendable {
+    let model: String?
+    let prompt: String
+    let system: String?
+    let stream: Bool?
+    let options: OllamaRequestOptions?
+}
+
+struct OllamaMessage: Codable, Sendable {
+    let role: String
+    let content: String
+}
+
+struct OllamaChatRequest: Decodable, Sendable {
+    let model: String?
+    let messages: [OllamaMessage]
+    let stream: Bool?
+    let options: OllamaRequestOptions?
+}
+
+struct OllamaRequestOptions: Decodable, Sendable {
+    let temperature: Double?
+    let num_predict: Int?
+}
+
+struct OllamaGenerateResponse: Encodable, Sendable {
+    let model: String
+    let created_at: String
+    let response: String
+    let done: Bool
+}
+
+struct OllamaChatResponse: Encodable, Sendable {
+    let model: String
+    let created_at: String
+    let message: OllamaMessage
+    let done: Bool
+}
+
+struct OllamaTagsResponse: Encodable, Sendable {
+    struct ModelInfo: Encodable, Sendable {
+        let name: String
+        let model: String
+        let modified_at: String
+        let size: Int
+    }
+    let models: [ModelInfo]
+}
+
+struct OllamaVersionResponse: Encodable, Sendable {
+    let version: String
+}
+
+private func currentTimestamp() -> String {
+    Date.now.formatted(.iso8601)
+}
+
+private func encodeJSONLine(_ value: some Encodable) throws -> ByteBuffer {
+    let data = try JSONEncoder().encode(value)
+    var buffer = ByteBufferAllocator().buffer(capacity: data.count + 1)
+    buffer.writeBytes(data)
+    buffer.writeString("\n")
+    return buffer
+}
+
+private func jsonResponse(_ value: some Encodable) throws -> Response {
+    let data = try JSONEncoder().encode(value)
+    var buffer = ByteBufferAllocator().buffer(capacity: data.count)
+    buffer.writeBytes(data)
+    return Response(
+        status: .ok,
+        headers: HTTPFields([HTTPField(name: .contentType, value: "application/json")]),
+        body: .init(byteBuffer: buffer)
+    )
+}
+
+private func decodeJSON<T: Decodable>(_ type: T.Type, from buffer: ByteBuffer) throws -> T {
+    var buf = buffer
+    let data = buf.readData(length: buf.readableBytes) ?? Data()
+    return try JSONDecoder().decode(type, from: data)
+}
+
+private func makeGenerationOptions(from options: OllamaRequestOptions?) -> GenerationOptions {
+    var genOptions = GenerationOptions()
+    if let temp = options?.temperature {
+        genOptions.temperature = temp
+    }
+    if let numPredict = options?.num_predict {
+        genOptions.maximumResponseTokens = numPredict
+    }
+    return genOptions
+}
+
+private func streamingResponse(
+    system: String?,
+    prompt: String,
+    options: GenerationOptions,
+    makeChunk: @escaping @Sendable (String, String, Bool) -> some Encodable & Sendable
+) -> Response {
+    let (byteStream, continuation) = AsyncStream<ByteBuffer>.makeStream()
+
+    Task {
+        do {
+            let session: LanguageModelSession
+            if let system, !system.isEmpty {
+                session = LanguageModelSession(instructions: system)
+            } else {
+                session = LanguageModelSession()
+            }
+
+            let stream = session.streamResponse(to: prompt, options: options)
+            var printedCount = 0
+            for try await partial in stream {
+                let content = partial.content
+                if content.utf8.count > printedCount {
+                    let start = content.utf8.index(content.utf8.startIndex, offsetBy: printedCount)
+                    let delta = String(content[start...])
+                    printedCount = content.utf8.count
+                    let buf = try encodeJSONLine(makeChunk(delta, currentTimestamp(), false))
+                    continuation.yield(buf)
+                }
+            }
+            let buf = try encodeJSONLine(makeChunk("", currentTimestamp(), true))
+            continuation.yield(buf)
+        } catch {
+            if let buf = try? encodeJSONLine(makeChunk("", currentTimestamp(), true)) {
+                continuation.yield(buf)
+            }
+        }
+        continuation.finish()
+    }
+
+    return Response(
+        status: .ok,
+        headers: HTTPFields([HTTPField(name: .contentType, value: "application/x-ndjson")]),
+        body: .init(asyncSequence: byteStream)
+    )
+}
+
+// MARK: - CLI
+
 @main
 struct FoundationModelsCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -82,11 +231,17 @@ struct FoundationModelsCLI: AsyncParsableCommand {
 
           # Array types
           foundation-models-cli "List 3 Japanese dishes" -f "dishes:[String]:List of dish names" -f "count:Int:Number of dishes"
+
+          # Ollama-compatible API server
+          foundation-models-cli --listen 127.0.0.1:11434
         """
     )
 
     @Argument(help: "Prompt to send to the LLM")
-    var prompt: String
+    var prompt: String?
+
+    @Option(name: .long, help: "Start Ollama-compatible API server (host:port)")
+    var listen: String?
 
     @Option(name: .shortAndLong, help: "System instructions")
     var instructions: String?
@@ -114,6 +269,12 @@ struct FoundationModelsCLI: AsyncParsableCommand {
         if stream && !field.isEmpty {
             throw ValidationError("--stream and --field cannot be used together")
         }
+        if listen != nil && prompt != nil {
+            throw ValidationError("--listen and prompt cannot be used together")
+        }
+        if listen == nil && prompt == nil {
+            throw ValidationError("Either prompt or --listen must be specified")
+        }
     }
 
     func run() async throws {
@@ -121,6 +282,16 @@ struct FoundationModelsCLI: AsyncParsableCommand {
         guard model.availability == .available else {
             throw ValidationError("Apple Intelligence model is not available. Please check your device and OS settings.")
         }
+
+        if let listen {
+            try await startServer(listen: listen)
+        } else {
+            try await handlePrompt()
+        }
+    }
+
+    private func handlePrompt() async throws {
+        guard let prompt else { return }
 
         let session: LanguageModelSession
         if let instructions {
@@ -182,5 +353,127 @@ struct FoundationModelsCLI: AsyncParsableCommand {
             }
             print(output)
         }
+    }
+
+    private func startServer(listen: String) async throws {
+        let parts = listen.split(separator: ":")
+        guard parts.count == 2, let port = Int(parts[1]) else {
+            throw ValidationError("Invalid listen address. Use host:port format (e.g., 127.0.0.1:11434)")
+        }
+        let host = String(parts[0])
+
+        let router = Router()
+
+        router.get("/") { _, _ in
+            "Ollama is running"
+        }
+
+        router.get("/api/version") { _, _ -> Response in
+            try jsonResponse(OllamaVersionResponse(version: "0.0.0"))
+        }
+
+        router.get("/api/tags") { _, _ -> Response in
+            try jsonResponse(OllamaTagsResponse(models: [
+                .init(name: ollamaModelDisplayName, model: ollamaModelID, modified_at: currentTimestamp(), size: 0),
+            ]))
+        }
+
+        router.post("/api/generate") { request, _ -> Response in
+            let buffer = try await request.body.collect(upTo: maxRequestBodySize)
+            let req = try decodeJSON(OllamaGenerateRequest.self, from: buffer)
+            let genOptions = makeGenerationOptions(from: req.options)
+            let shouldStream = req.stream ?? true
+
+            if shouldStream {
+                return streamingResponse(
+                    system: req.system,
+                    prompt: req.prompt,
+                    options: genOptions
+                ) { delta, timestamp, done in
+                    OllamaGenerateResponse(
+                        model: ollamaModelID,
+                        created_at: timestamp,
+                        response: delta,
+                        done: done
+                    )
+                }
+            } else {
+                let session: LanguageModelSession
+                if let system = req.system {
+                    session = LanguageModelSession(instructions: system)
+                } else {
+                    session = LanguageModelSession()
+                }
+                let response = try await session.respond(to: req.prompt, options: genOptions)
+                return try jsonResponse(OllamaGenerateResponse(
+                    model: ollamaModelID,
+                    created_at: currentTimestamp(),
+                    response: response.content,
+                    done: true
+                ))
+            }
+        }
+
+        router.post("/api/chat") { request, _ -> Response in
+            let buffer = try await request.body.collect(upTo: maxRequestBodySize)
+            let req = try decodeJSON(OllamaChatRequest.self, from: buffer)
+            let genOptions = makeGenerationOptions(from: req.options)
+
+            let systemMessages = req.messages.filter { $0.role == "system" }
+            let systemInstruction = systemMessages.map(\.content).joined(separator: "\n")
+
+            let nonSystemMessages = req.messages.filter { $0.role != "system" }
+            guard let lastUserMessage = nonSystemMessages.last?.content else {
+                return Response(status: .badRequest)
+            }
+
+            let prompt: String
+            if nonSystemMessages.count > 1 {
+                let history = nonSystemMessages.dropLast()
+                let context = history.map { "\($0.role): \($0.content)" }.joined(separator: "\n")
+                prompt = "Previous conversation:\n\(context)\n\nuser: \(lastUserMessage)"
+            } else {
+                prompt = lastUserMessage
+            }
+
+            let shouldStream = req.stream ?? true
+
+            if shouldStream {
+                return streamingResponse(
+                    system: systemInstruction.isEmpty ? nil : systemInstruction,
+                    prompt: prompt,
+                    options: genOptions
+                ) { delta, timestamp, done in
+                    OllamaChatResponse(
+                        model: ollamaModelID,
+                        created_at: timestamp,
+                        message: OllamaMessage(role: "assistant", content: delta),
+                        done: done
+                    )
+                }
+            } else {
+                let session: LanguageModelSession
+                if !systemInstruction.isEmpty {
+                    session = LanguageModelSession(instructions: systemInstruction)
+                } else {
+                    session = LanguageModelSession()
+                }
+                let response = try await session.respond(to: prompt, options: genOptions)
+                return try jsonResponse(OllamaChatResponse(
+                    model: ollamaModelID,
+                    created_at: currentTimestamp(),
+                    message: OllamaMessage(role: "assistant", content: response.content),
+                    done: true
+                ))
+            }
+        }
+
+        let app = Application(
+            router: router,
+            configuration: .init(address: .hostname(host, port: port))
+        )
+
+        print("Ollama-compatible server listening on \(host):\(port)")
+        try await app.runService()
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: foundation-models-cli
-description: Use foundation-models-cli to interact with Apple's on-device LLM via the FoundationModels framework. This skill should be used when the user wants to send prompts to the local Apple Intelligence model, get structured JSON output from the on-device LLM, or test prompts with various generation options like temperature and streaming.
+description: Use foundation-models-cli to interact with Apple's on-device LLM via the FoundationModels framework. This skill should be used when the user wants to send prompts to the local Apple Intelligence model, get structured JSON output from the on-device LLM, test prompts with various generation options like temperature and streaming, or start an Ollama-compatible API server.
 ---
 
 # foundation-models-cli
@@ -20,6 +20,7 @@ cp .build/release/foundation-models-cli /usr/local/bin/
 
 ```
 foundation-models-cli <prompt> [options]
+foundation-models-cli --listen <host:port>
 ```
 
 ### Options
@@ -32,6 +33,7 @@ foundation-models-cli <prompt> [options]
 | `--greedy` | | Use greedy sampling for deterministic output |
 | `--stream` | `-s` | Enable streaming output |
 | `--field <spec>` | `-f` | Structured output field in `name:Type:description` format. Can be repeated. |
+| `--listen <host:port>` | | Start Ollama-compatible API server |
 
 ### Supported types for `--field`
 
@@ -86,11 +88,22 @@ foundation-models-cli "List 3 popular Japanese dishes" \
   -f "descriptions:[String]:Brief description of each dish"
 ```
 
+### Ollama-compatible API server
+
+Start an Ollama-compatible HTTP API server to use Apple's on-device model from any Ollama client.
+
+```bash
+foundation-models-cli --listen 127.0.0.1:11434
+```
+
+Supported endpoints: `GET /`, `GET /api/version`, `GET /api/tags`, `POST /api/generate`, `POST /api/chat`. Both streaming (ndjson) and non-streaming responses are supported.
+
 ## Guidelines
 
 - Always quote the prompt argument to avoid shell interpretation issues
 - Use `--max-tokens` to prevent repetitive generation on open-ended prompts
 - `--stream` and `--field` cannot be used together
+- `--listen` and prompt cannot be used together
 - The on-device model has a 4096 token context window; keep prompts concise
 - For deterministic output, use `--greedy`
 - Structured output uses `DynamicGenerationSchema` for type-safe Guided Generation
